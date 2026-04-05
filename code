@@ -1,0 +1,1076 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from scipy.interpolate import interp1d
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.metrics import r2_score, mean_squared_error
+import socket
+import time
+from datetime import datetime, timedelta
+import warnings
+import os
+import statsmodels.api as sm
+import matplotlib.dates as mdates
+warnings.filterwarnings('ignore')
+
+class UnifiedEnvironmentalAnalysisSystem:
+    def __init__(self, csv_file_path):
+        self.csv_file_path = csv_file_path
+        self.may_csv_path = "may_data.csv"
+        self.raw_data = None
+        self.clean_data = None
+        self.may_data = None
+        self.simulation_data = None
+        self.simulation_start_day = 27
+        self.simulation_start_hour = 10
+        self.output_dir = self._create_output_directory()
+        self.collected_data, self.wifi_log = [], []
+        self.is_collecting = False
+        self.current_csv_index = 0
+        self.params = ['T(C)', 'RH(%)', 'PM2.5', 'PM10', 'PM1.0']
+        self.param_labels = ['Temperature (°C)', 'Humidity (%)', 'PM2.5 (μg/m³)', 'PM10 (μg/m³)', 'PM1.0 (μg/m³)']
+        self.sarima_models = {}
+        self.interp_functions = {}
+
+    def _create_output_directory(self):
+         output_dir = 'environmental_analysis_results'
+         os.makedirs(output_dir, exist_ok=True)
+         return output_dir
+    
+    def load_and_clean_data(self, verbose=True):
+        if verbose: print("LOADING AND CLEANING DATA\n" + "-" * 40)
+        
+        self.raw_data = pd.read_csv(self.csv_file_path)
+        original_count = len(self.raw_data)
+        if verbose: print(f"Original records: {original_count:,}")
+        
+        # Add time features
+        self.raw_data['time'] = pd.to_datetime(self.raw_data['time'])
+        time_features = ['month', 'date', 'day_of_year', 'hour', 'month_numeric']
+        time_methods = [lambda x: x.dt.to_period('M'), lambda x: x.dt.date, 
+                       lambda x: x.dt.dayofyear, lambda x: x.dt.hour, lambda x: x.dt.month]
+        for feature, method in zip(time_features, time_methods):
+            self.raw_data[feature] = method(self.raw_data['time'])
+        
+        if verbose: print(f"Data spans from {self.raw_data['time'].min()} to {self.raw_data['time'].max()}")
+        
+        # Apply filters for valid ranges
+        self.clean_data = self.raw_data[
+            (self.raw_data['T(C)'] >= -60) & (self.raw_data['T(C)'] <= 60) &
+            (self.raw_data['RH(%)'] >= 0) & (self.raw_data['RH(%)'] <= 100) &
+            (self.raw_data['PM2.5'] >= 0) &
+            (self.raw_data['PM10'] >= 0) &
+            (self.raw_data['PM1.0'] >= 0)
+        ].copy().reset_index(drop=True)
+        
+        removed_count = original_count - len(self.clean_data)
+        if verbose: print(f"Clean records: {len(self.clean_data):,}\nRemoved records: {removed_count:,} ({removed_count/original_count*100:.2f}%)")
+        
+        # Add time_numeric
+        self.clean_data['time_numeric'] = (self.clean_data['time'] - self.clean_data['time'].min()).dt.total_seconds() / 86400.0
+        
+        return self.clean_data
+    
+    def load_may_data(self, verbose=True):
+        if verbose: print("LOADING MAY DATA\n" + "-" * 40)
+        
+        may_raw = pd.read_csv(self.may_csv_path)
+        original_count = len(may_raw)
+        if verbose: print(f"Original records in May data: {original_count:,}")
+        
+        # Add time features
+        may_raw['time'] = pd.to_datetime(may_raw['time'])
+        time_features = ['month', 'date', 'day_of_year', 'hour', 'month_numeric']
+        time_methods = [lambda x: x.dt.to_period('M'), lambda x: x.dt.date, 
+                       lambda x: x.dt.dayofyear, lambda x: x.dt.hour, lambda x: x.dt.month]
+        for feature, method in zip(time_features, time_methods):
+            may_raw[feature] = method(may_raw['time'])
+        
+        if verbose: print(f"May data spans from {may_raw['time'].min()} to {may_raw['time'].max()}")
+        
+        # Apply filters for valid ranges
+        self.may_data = may_raw[
+            (may_raw['T(C)'] >= -60) & (may_raw['T(C)'] <= 60) &
+            (may_raw['RH(%)'] >= 0) & (may_raw['RH(%)'] <= 100) &
+            (may_raw['PM2.5'] >= 0) &
+            (may_raw['PM10'] >= 0) &
+            (may_raw['PM1.0'] >= 0)
+        ].copy().reset_index(drop=True)
+        
+        removed_count = original_count - len(self.may_data)
+        if verbose: print(f"Clean records in May data: {len(self.may_data):,}\nRemoved records: {removed_count:,} ({removed_count/original_count*100:.2f}%)")
+        
+        # Add time_numeric
+        self.may_data['time_numeric'] = (self.may_data['time'] - self.may_data['time'].min()).dt.total_seconds() / 86400.0
+        
+        # Extract simulation data starting from May 27, 10:00 AM
+        may_year = self.may_data['time'].min().year
+        may_month = self.may_data['time'].min().month
+        simulation_start_str = f"{may_year}-{may_month:02d}-{self.simulation_start_day:02d} {self.simulation_start_hour:02d}:00:00"
+        simulation_start_time = pd.to_datetime(simulation_start_str)
+        self.simulation_data = self.may_data[self.may_data['time'] >= simulation_start_time].sort_values('time').reset_index(drop=True)
+        if verbose: print(f"Simulation data starts from {simulation_start_time} with {len(self.simulation_data)} records.")
+        
+        # Fit SARIMA models on May 1-26 (resampled to 1H) and prepare interpolation functions for forecasts
+        may_df_resampled = self.may_data.set_index('time')[self.params].resample('1H').mean().reset_index()
+        train_df = may_df_resampled[may_df_resampled['time'].dt.day <= 26]
+        
+        for param in self.params:
+            series_train = train_df.set_index('time')[param].dropna()
+            if len(series_train) < 10:
+                if verbose: print(f"Skipping SARIMA fit for {param}: Insufficient training data.")
+                continue
+            
+            sarima_model = sm.tsa.SARIMAX(series_train, order=(1,1,1), seasonal_order=(1,1,1,24))
+            sarima_fit = sarima_model.fit()
+            self.sarima_models[param] = sarima_fit
+            
+            # Pre-forecast 48 steps (covers May 27 and beyond)
+            forecast_steps = 48
+            forecast = sarima_fit.forecast(steps=forecast_steps)
+            last_time = series_train.index[-1]
+            forecast_index = pd.date_range(start=last_time + timedelta(hours=1), periods=forecast_steps, freq='1H')
+            
+            # Create interpolation function
+            x_num = mdates.date2num(forecast_index)
+            y = forecast.values
+            self.interp_functions[param] = interp1d(x_num, y, kind='linear', fill_value='extrapolate')
+            if verbose: print(f"SARIMA model and interp function prepared for {param}.")
+        
+        return self.may_data
+    
+    def calculate_statistics(self):
+        print("\nCALCULATING COMPREHENSIVE STATISTICS\n" + "-" * 40)
+        
+        # Calculate all statistics in parallel
+        stats_funcs = ['mean', 'median', 'min', 'max', 'std', 'count']
+        monthly_stats = {param: self.clean_data.groupby('month')[param].agg(stats_funcs).round(3) 
+                        for param in self.params}
+        daily_stats = {param: self.clean_data.groupby('date')[param].agg(['mean', 'median', 'min', 'max']).round(3) 
+                      for param in self.params}
+        
+        # Overall statistics using pandas describe + additional metrics
+        base_stats = self.clean_data[self.params].describe().T
+        additional_stats = pd.DataFrame({
+            'IQR': base_stats['75%'] - base_stats['25%'],
+            'Skewness': [stats.skew(self.clean_data[param]) for param in self.params],
+            'Kurtosis': [stats.kurtosis(self.clean_data[param]) for param in self.params]
+        }, index=self.params)
+        overall_stats = pd.concat([base_stats, additional_stats], axis=1).round(3)
+        
+        print(f"Monthly and daily statistics calculated\n\nOverall Statistical Summary:\n{overall_stats}")
+        
+        # Additional: Print monthly stats table for each parameter in terminal
+        print("\nMonthly Statistics for Each Parameter:")
+        print("-" * 40)
+        for param in self.params:
+            print(f"\n{param}:")
+            print(monthly_stats[param].to_string())
+        
+        return monthly_stats, daily_stats, overall_stats
+    
+    def plot_temporal_trends(self, monthly_stats, daily_stats):
+        print("\nCREATING TEMPORAL TREND PLOTS\n" + "-" * 40)
+        
+        # Monthly and daily trends, each param in separate figure
+        for stats_data, title in [(monthly_stats, 'Monthly'), 
+                                (daily_stats, 'Daily')]:
+            for i, (param, label) in enumerate(zip(self.params, self.param_labels)):
+                fig, ax = plt.subplots(figsize=(9, 5))
+                fig.suptitle(f'{label} - {title} Trends', fontsize=16)
+                
+                data = stats_data[param]
+                x_vals = data.index.astype(str) if title == 'Monthly' else data.index
+                
+                if title == 'Monthly':
+                    ax.plot(x_vals, data['mean'], 'o-', label='Mean', linewidth=2, markersize=8)
+                    ax.plot(x_vals, data['median'], 's-', label='Median', linewidth=2, markersize=8)
+                    ax.fill_between(x_vals, data['mean'] - data['std'], 
+                                   data['mean'] + data['std'], alpha=0.3, label='±1 Std')
+                else:
+                    ax.plot(x_vals, data['mean'], label='Mean', linewidth=1, alpha=0.8)
+                    ax.plot(x_vals, data['median'], label='Median', linewidth=1, alpha=0.8)
+                
+                ax.set_xlabel('Month' if title == 'Monthly' else 'Date')
+                ax.set_ylabel(label)
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+                ax.tick_params(axis='x', rotation=45)
+                
+                plt.tight_layout()
+                plt.show()
+        
+        print("\nCREATING EXTENDED TEMPORAL TREND PLOTS WITH MIN/MAX\n" + "-" * 40)
+        
+        for stats_data, title in [(monthly_stats, 'Monthly'), 
+                                  (daily_stats, 'Daily')]:
+            for i, (param, label) in enumerate(zip(self.params, self.param_labels)):
+                fig, ax = plt.subplots(figsize=(9, 5))
+                fig.suptitle(f'{label} - {title} Trends with Min/Max', fontsize=16)
+                
+                data = stats_data[param]
+                x_vals = data.index.astype(str) if title == 'Monthly' else data.index
+                
+                if title == 'Monthly':
+                    ax.plot(x_vals, data['mean'], 'o-', label='Mean', linewidth=2, markersize=8)
+                    ax.plot(x_vals, data['median'], 's-', label='Median', linewidth=2, markersize=8)
+                    ax.plot(x_vals, data['min'], '^-', label='Min', linewidth=2, markersize=8, color='green')
+                    ax.plot(x_vals, data['max'], 'v-', label='Max', linewidth=2, markersize=8, color='black')
+                    ax.fill_between(x_vals, data['mean'] - data['std'], 
+                                    data['mean'] + data['std'], alpha=0.3, label='±1 Std')
+                else:
+                    ax.plot(x_vals, data['mean'], label='Mean', linewidth=1, alpha=0.8)
+                    ax.plot(x_vals, data['median'], label='Median', linewidth=1, alpha=0.8)
+                    ax.plot(x_vals, data['min'], label='Min', linewidth=1, alpha=0.8, color='green')
+                    ax.plot(x_vals, data['max'], label='Max', linewidth=1, alpha=0.8, color='black')
+                
+                ax.set_xlabel('Month' if title == 'Monthly' else 'Date')
+                ax.set_ylabel(label)
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+                ax.tick_params(axis='x', rotation=45)
+                
+                plt.tight_layout()
+                plt.show()
+    
+    def correlation_analysis(self):
+        print("\nCORRELATION ANALYSIS\n" + "-" * 40)
+        
+        corr_matrix = self.clean_data[self.params].corr()
+        print(f"Correlation Matrix:\n{corr_matrix.round(3)}")
+        
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(corr_matrix, annot=True, cmap='RdBu_r', center=0, square=True, fmt='.3f')
+        plt.title('Environmental Parameters Correlation Matrix')
+        plt.tight_layout()
+        plt.show()
+        
+        # Get correlation pairs in one comprehension
+        corr_pairs = [(self.params[i], self.params[j], corr_matrix.iloc[i, j]) 
+                     for i in range(len(self.params)) for j in range(i+1, len(self.params))]
+        corr_pairs.sort(key=lambda x: abs(x[2]), reverse=True)
+        
+        print("\nStrongest Correlations:")
+        for param1, param2, corr in corr_pairs:
+            strength = "Strong" if abs(corr) > 0.7 else "Moderate" if abs(corr) > 0.4 else "Weak"
+            direction = "positive" if corr > 0 else "negative"
+            print(f"{param1} vs {param2}: {corr:.3f} ({strength} {direction})")
+        
+        return corr_matrix, corr_pairs
+    
+    def distribution_analysis(self):
+        print("\nDISTRIBUTION ANALYSIS\n" + "-" * 40)
+        
+        # Distribution plots, each in separate figure
+        for i, (param, label) in enumerate(zip(self.params, self.param_labels)):
+            fig, ax = plt.subplots(figsize=(9, 5))
+            fig.suptitle(f'{label} Distribution', fontsize=16)
+            
+            data = self.clean_data[param]
+            
+            # Combined histogram and KDE
+            ax.hist(data, bins=50, alpha=0.7, density=True, color='skyblue', edgecolor='black')
+            x_range = np.linspace(data.min(), data.max(), 100)
+            kde = stats.gaussian_kde(data)
+            ax.plot(x_range, kde(x_range), 'r-', linewidth=2, label='KDE')
+            
+            # Mean and median lines
+            mean_val, median_val = data.mean(), data.median()
+            for val, color, name in [(mean_val, 'red', 'Mean'), (median_val, 'green', 'Median')]:
+                ax.axvline(val, color=color, linestyle='--', linewidth=2, label=f'{name}: {val:.2f}')
+            
+            # Statistics text
+            skewness, kurtosis = stats.skew(data), stats.kurtosis(data)
+            ax.text(0.02, 0.98, f'Skew: {skewness:.2f}\nKurt: {kurtosis:.2f}', 
+                   transform=ax.transAxes, verticalalignment='top',
+                   bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+            
+            ax.set_xlabel(label)
+            ax.set_ylabel('Density')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            plt.show()
+
+            # Calculate and print bin details in terminal (width and height on Y-axis)
+            print(f"\nBin Details for {param} (Width and Height on Y-axis):")
+            print("-" * 50)
+            n, bins = np.histogram(data, bins=50, density=True)
+            widths = np.diff(bins)
+            width = widths[0]  # Since all widths are equal
+            print(f"Bin Width (common for all): {width:.3f}")
+            for j in range(len(n)):
+                if n[j] > 0:
+                    height = n[j]
+                    area = height * width
+                    print(f"Bin {j+1}: Height (Density)={height:.3f}, height*width = {area:.3f}")
+            print("-" * 50)
+        
+        # Box plots, each param in separate figure
+        for param in self.params:
+            fig, ax = plt.subplots(figsize=(6, 8))
+            self.clean_data[[param]].boxplot(ax=ax)
+            ax.set_title(f'Box Plot - {param} Outlier Detection')
+            ax.tick_params(axis='x', rotation=45)
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.show()
+
+            # Calculate and print outlier information
+            data = self.clean_data[param]
+            q1 = data.quantile(0.25)
+            q3 = data.quantile(0.75)
+            iqr = q3 - q1
+            lower_bound = q1 - 1.5 * iqr
+            upper_bound = q3 + 1.5 * iqr
+            outliers = data[(data < lower_bound) | (data > upper_bound)]
+            outlier_percentage = (len(outliers) / len(data)) * 100
+            print(f"\nOutlier Analysis for {param}:")
+            print(f"Q1: {q1:.2f}, Q3: {q3:.2f}, IQR: {iqr:.2f}")
+            print(f"Lower Bound: {lower_bound:.2f}, Upper Bound: {upper_bound:.2f}")
+            print(f"Number of Outliers: {len(outliers)} ({outlier_percentage:.2f}%)")
+            if len(outliers) > 0:
+                print(f"Outlier Range: Min {outliers.min():.2f}, Max {outliers.max():.2f}")
+            else:
+                print("No outliers detected.")
+    
+    
+    def _perform_regression(self, X, y, model, model_name=""):
+        """Helper function for common regression operations"""
+        model.fit(X, y)
+        y_pred = model.predict(X)
+        
+        metrics = {
+            'r2': r2_score(y, y_pred)
+        }
+        
+        # Calculate p-value using statsmodels
+        has_constant = any(np.allclose(X[:, i], 1) for i in range(X.shape[1])) if X.ndim > 1 else False
+        if has_constant:
+            sm_model = sm.OLS(y, X).fit()
+        else:
+            sm_model = sm.OLS(y, sm.add_constant(X)).fit()
+        metrics['p_value'] = sm_model.f_pvalue
+        
+        if model_name: 
+            print(f"{model_name} - R²: {metrics['r2']:.3f}, p-value: {metrics['p_value']:.3e}")
+        
+        return model, metrics, y_pred
+    
+    def simple_linear_regression(self, x_var, y_var):
+        print(f"\nSimple Linear Regression: {y_var} vs {x_var}")
+        
+        df = self.clean_data[[x_var, y_var]].dropna()
+        X = df[x_var].values.reshape(-1, 1)
+        y = df[y_var].values
+        
+        model, metrics, y_pred = self._perform_regression(
+            X, y, LinearRegression()
+        )
+        print(f"Coefficient: {model.coef_[0]:.4f}, Intercept: {model.intercept_:.4f}, p-value: {metrics['p_value']:.3e}")
+        
+        # Separate figures: Scatter with fit line
+        fig1, ax1 = plt.subplots(figsize=(8, 5))
+        
+        ax1.scatter(X, y, alpha=0.6, label='Actual', s=5)
+        
+        # Add fit line
+        X_plot = np.linspace(X.min(), X.max(), 100).reshape(-1, 1)
+        y_plot = model.predict(X_plot)
+        ax1.plot(X_plot, y_plot, 'r-', linewidth=2, label='Fit')
+        
+        ax1.set_xlabel(x_var)
+        ax1.set_ylabel(y_var)
+        ax1.set_title(f'Simple Linear Regression\n{y_var} vs {x_var} (Full Data)\nR² = {metrics["r2"]:.3f}, p = {metrics["p_value"]:.3e}')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        return model, metrics['r2'], metrics['p_value']
+    
+    def polynomial_regression(self, x_var, y_var, degrees=[4]):
+        print(f"\nPolynomial Regression: {y_var} vs {x_var}")
+        
+        df = self.may_data[['time', x_var, y_var]].sort_values('time')
+        X = df[x_var].values.reshape(-1, 1)
+        y = df[y_var].values
+        times = df['time'].values
+        
+        results = {}
+        for degree in degrees:
+            poly_features = PolynomialFeatures(degree=degree)
+            X_poly = poly_features.fit_transform(X)
+            
+            model, metrics, y_pred = self._perform_regression(
+                X_poly, y, LinearRegression(), f"Degree {degree}"
+            )
+            results[degree] = {'model': model, 'poly_features': poly_features, **metrics}
+        
+        # Separate figures
+        X_plot = np.linspace(X.min(), X.max(), 100).reshape(-1, 1)
+        dates_plot = df['time'].min() + pd.to_timedelta(X_plot.flatten(), unit='D')
+        for i, degree in enumerate(degrees):
+            result = results[degree]
+            X_plot_poly = result['poly_features'].transform(X_plot)
+            y_plot_pred = result['model'].predict(X_plot_poly)
+            
+            fig, ax = plt.subplots(figsize=(8, 5))
+            ax.scatter(times, y, alpha=0.6, label='Actual', s=5)
+            ax.plot(dates_plot, y_plot_pred, 'r-', linewidth=2, label=f'Degree {degree} fit')
+            ax.set_xlabel('Time')
+            ax.set_ylabel(y_var)
+            ax.set_title(f'Polynomial Degree {degree} (May Data)\nR² = {result["r2"]:.3f}, p = {result["p_value"]:.3e}')
+            ax.xaxis.set_major_locator(mdates.MonthLocator())
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            ax.tick_params(axis='x', rotation=45)
+            plt.tight_layout()
+            plt.show()
+        
+        return results
+    
+    def time_series_regression(self):
+        print("\nTIME SERIES REGRESSION\n" + "-" * 40)
+    
+        df_sorted = self.may_data.sort_values('time').reset_index(drop=True)
+        df_sorted['time_numeric'] = (df_sorted['time'] - df_sorted['time'].min()).dt.total_seconds() / 86400.0
+    
+        results = {}
+        
+        # Linear trends, each in separate figure
+        for param in self.params:
+            fig, ax = plt.subplots(figsize=(9, 5))
+            
+            X = df_sorted['time_numeric'].values.reshape(-1, 1)
+            y = df_sorted[param].values
+            mask = ~(np.isnan(X.flatten()) | np.isnan(y))
+            X, y = X[mask], y[mask]
+        
+            model = LinearRegression().fit(X, y)
+            y_pred = model.predict(X)
+        
+            r2, slope = r2_score(y, y_pred), model.coef_[0]
+            p_value = stats.pearsonr(X.flatten(), y)[1]
+        
+            trend_direction = "increasing" if slope > 0 else "decreasing"
+            significance = "significant" if p_value < 0.05 else "not significant"
+        
+            print(f"\n{param}: R²={r2:.3f}, Slope={slope:.6f}/day, Trend={trend_direction} ({significance})")
+        
+            results[param] = {
+                'slope': slope, 'r2': r2, 'p_value': p_value,
+                'trend': trend_direction, 'significant': p_value < 0.05
+            }
+        
+            ax.scatter(df_sorted['time'][mask], df_sorted[param][mask], alpha=0.6, s=10)
+            ax.plot(df_sorted['time'][mask], y_pred, 'r-', linewidth=2, label=f'Trend (R²={r2:.3f})')
+            ax.set(xlabel='Time', ylabel=param, title=f'{param} Time Series (May Data)\nSlope: {slope:.4f}/day')
+            ax.xaxis.set_major_locator(mdates.MonthLocator())
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            ax.tick_params(axis='x', rotation=45)
+            
+            plt.tight_layout()
+            plt.show()
+        
+        # Additional ARIMA regression (limited to May data only)
+        print("\nARIMA REGRESSION (MAY DATA ONLY)\n" + "-" * 40)
+        
+        may_df = df_sorted  # Since may_data is already May data
+        if len(may_df) == 0:
+            print("No data available for May. Skipping ARIMA.")
+            return results
+        
+        # Ensure 'time' is datetime
+        may_df['time'] = pd.to_datetime(may_df['time'])
+        
+        # Resample to hourly intervals (changed from '10T' for better computation and daily seasonality capture)
+        may_df = may_df.set_index('time')[self.params].resample('1H').mean().reset_index()
+        
+        # Split into train (days 1-26) and test (day 27)
+        train_df = may_df[may_df['time'].dt.day <= 26]
+        test_df = may_df[may_df['time'].dt.day == 27]
+        
+        arima_results = {}
+        
+        for param in self.params:
+            fig, ax = plt.subplots(figsize=(9, 5))
+            
+            series_train = train_df.set_index('time')[param].dropna()
+            series_test = test_df.set_index('time')[param].dropna()
+            if len(series_train) < 10:  # Skip if too few data points in train
+                print(f"Skipping ARIMA for {param} (May): Insufficient data in training set")
+                continue
+            
+            # Fit ARIMA with order (1,1,1) as a simple example; adjust as needed
+            arima_model = sm.tsa.ARIMA(series_train, order=(1,1,1))
+            arima_fit = arima_model.fit()
+            
+            fitted_train = arima_fit.fittedvalues
+            aic = arima_fit.aic
+            print(f"\n{param} ARIMA (May): AIC={aic:.3f}")
+            
+            forecast_steps = len(series_test)
+            if forecast_steps > 0:
+                forecast = arima_fit.forecast(steps=forecast_steps)
+                forecast.index = series_test.index  # Align forecast index with test
+                mse = mean_squared_error(series_test, forecast)
+                print(f"Test MSE: {mse:.3f}")
+            else:
+                forecast = pd.Series()
+                mse = None
+                print("No test data available for forecasting.")
+            
+            arima_results[param] = {
+                'aic': aic,
+                'summary': arima_fit.summary(),
+                'mse': mse,
+                'series_train': series_train,
+                'fitted_train': fitted_train,
+                'series_test': series_test,
+                'forecast': forecast
+            }
+            
+            ax.plot(series_train.index, series_train, alpha=0.6, label='Train Actual (May 1-26)')
+            ax.plot(fitted_train.index, fitted_train, 'g-', linewidth=2, label=f'Train Fit (AIC={aic:.3f})')
+            if len(forecast) > 0:
+                ax.plot(series_test.index, series_test, alpha=0.6, label='Test Actual (May 27)', color='orange')
+                ax.plot(forecast.index, forecast, 'r--', linewidth=2, label=f'Forecast (MSE={mse:.3f})')
+            ax.set(xlabel='Time', ylabel=param, title=f'{param} ARIMA Time Series (May: Train 1-26, Test 27)')
+            ax.xaxis.set_major_locator(mdates.DayLocator(interval=5))
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%d'))
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            ax.tick_params(axis='x', rotation=45)
+            
+            plt.tight_layout()
+            plt.show()
+        
+        # Zoomed ARIMA Plots for May 27 (with May 26 context), each separate
+        print("\nZoomed ARIMA Plots for May 27 (with May 26 context)\n" + "-" * 40)
+        
+        for param in self.params:
+            if param not in arima_results:
+                continue
+            
+            fig, ax = plt.subplots(figsize=(9, 5))
+            
+            data = arima_results[param]
+            series_train = data['series_train']
+            fitted_train = data['fitted_train']
+            series_test = data['series_test']
+            forecast = data['forecast']
+            mse = data['mse']
+            
+            # Get data from May 26 onwards
+            if not series_train.empty:
+                start_zoom = pd.Timestamp(series_train.index.max().date() - timedelta(days=1))
+                series_train_zoom = series_train[series_train.index >= start_zoom]
+                fitted_train_zoom = fitted_train[fitted_train.index >= start_zoom]
+            else:
+                series_train_zoom = pd.Series()
+                fitted_train_zoom = pd.Series()
+            
+            ax.plot(series_train_zoom.index, series_train_zoom, alpha=0.6, label='Train Actual (May 26)')
+            ax.plot(fitted_train_zoom.index, fitted_train_zoom, 'g-', linewidth=2, label='Train Fit')
+            ax.plot(series_test.index, series_test, alpha=0.6, label='Test Actual (May 27)', color='orange')
+            if len(forecast) > 0:
+                ax.plot(forecast.index, forecast, 'r--', linewidth=2, label=f'Forecast (MSE={mse:.3f})')
+            ax.set(xlabel='Time', ylabel=param, title=f'{param} ARIMA - Zoomed May 26-27')
+            ax.xaxis.set_major_locator(mdates.HourLocator(interval=6))
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %H:%M'))
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            ax.tick_params(axis='x', rotation=45)
+            
+            plt.tight_layout()
+            plt.show()
+        
+        # Additional SARIMA regression, each separate
+        print("\nSARIMA REGRESSION (MAY DATA ONLY)\n" + "-" * 40)
+        
+        sarima_results = {}
+        
+        for param in self.params:
+            fig, ax = plt.subplots(figsize=(9, 5))
+            
+            series_train = train_df.set_index('time')[param].dropna()
+            series_test = test_df.set_index('time')[param].dropna()
+            if len(series_train) < 10:  # Skip if too few data points in train
+                print(f"Skipping SARIMA for {param} (May): Insufficient data in training set")
+                continue
+            
+            # Fit SARIMA with order (1,1,1) and seasonal_order (1,1,1,24) - now matches daily with hourly resample
+            sarima_model = sm.tsa.SARIMAX(series_train, order=(1,1,1), seasonal_order=(1,1,1,24))
+            sarima_fit = sarima_model.fit()
+            
+            fitted_train = sarima_fit.fittedvalues
+            aic = sarima_fit.aic
+            print(f"\n{param} SARIMA (May): AIC={aic:.3f}")
+            
+            forecast_steps = len(series_test)
+            if forecast_steps > 0:
+                forecast = sarima_fit.forecast(steps=forecast_steps)
+                forecast.index = series_test.index  # Align forecast index with test
+                mse = mean_squared_error(series_test, forecast)
+                print(f"Test MSE: {mse:.3f}")
+            else:
+                forecast = pd.Series()
+                mse = None
+                print("No test data available for forecasting.")
+            
+            sarima_results[param] = {
+                'aic': aic,
+                'summary': sarima_fit.summary(),
+                'mse': mse,
+                'series_train': series_train,
+                'fitted_train': fitted_train,
+                'series_test': series_test,
+                'forecast': forecast
+            }
+            
+            ax.plot(series_train.index, series_train, alpha=0.6, label='Train Actual (May 1-26)')
+            ax.plot(fitted_train.index, fitted_train, 'g-', linewidth=2, label=f'Train Fit (AIC={aic:.3f})')
+            if len(forecast) > 0:
+                ax.plot(series_test.index, series_test, alpha=0.6, label='Test Actual (May 27)', color='orange')
+                ax.plot(forecast.index, forecast, 'r--', linewidth=2, label=f'Forecast (MSE={mse:.3f})')
+            ax.set(xlabel='Time', ylabel=param, title=f'{param} SARIMA Time Series (May: Train 1-26, Test 27)')
+            ax.xaxis.set_major_locator(mdates.DayLocator(interval=5))
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%d'))
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            ax.tick_params(axis='x', rotation=45)
+            
+            plt.tight_layout()
+            plt.show()
+        
+        # Zoomed SARIMA Plots for May 27 (with May 26 context), each separate
+        print("\nZoomed SARIMA Plots for May 27 (with May 26 context)\n" + "-" * 40)
+        
+        for param in self.params:
+            if param not in sarima_results:
+                continue
+            
+            fig, ax = plt.subplots(figsize=(9, 5))
+            
+            data = sarima_results[param]
+            series_train = data['series_train']
+            fitted_train = data['fitted_train']
+            series_test = data['series_test']
+            forecast = data['forecast']
+            mse = data['mse']
+            
+            # Get data from May 26 onwards
+            if not series_train.empty:
+                start_zoom = pd.Timestamp(series_train.index.max().date() - timedelta(days=1))
+                series_train_zoom = series_train[series_train.index >= start_zoom]
+                fitted_train_zoom = fitted_train[fitted_train.index >= start_zoom]
+            else:
+                series_train_zoom = pd.Series()
+                fitted_train_zoom = pd.Series()
+            
+            ax.plot(series_train_zoom.index, series_train_zoom, alpha=0.6, label='Train Actual (May 26)')
+            ax.plot(fitted_train_zoom.index, fitted_train_zoom, 'g-', linewidth=2, label='Train Fit')
+            ax.plot(series_test.index, series_test, alpha=0.6, label='Test Actual (May 27)', color='orange')
+            if len(forecast) > 0:
+                ax.plot(forecast.index, forecast, 'r--', linewidth=2, label=f'Forecast (MSE={mse:.3f})')
+            ax.set(xlabel='Time', ylabel=param, title=f'{param} SARIMA - Zoomed May 26-27')
+            ax.xaxis.set_major_locator(mdates.HourLocator(interval=6))
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %H:%M'))
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            ax.tick_params(axis='x', rotation=45)
+            
+            plt.tight_layout()
+            plt.show()
+        
+        results['arima'] = arima_results
+        results['sarima'] = sarima_results
+        
+        return results
+    
+    def check_device_wifi(self, timeout=2):
+        """Check WiFi connection status"""
+        for server in [("8.8.8.8", 53), ("1.1.1.1", 53)]:
+            try:
+                socket.create_connection(server, timeout=timeout)
+                return True
+            except OSError:
+                continue
+        return False
+    
+    def get_real_data_point(self, timestamp):
+        """Get next data point from the simulation data (May 27, 10 AM onward)"""
+        if self.simulation_data is None or len(self.simulation_data) == 0: return None
+        
+        if self.current_csv_index >= len(self.simulation_data): self.current_csv_index = 0
+        
+        row = self.simulation_data.iloc[self.current_csv_index].copy()
+        row['time'], row['data_source'] = timestamp, 'real'
+        
+        self.current_csv_index += 1
+        return row.to_dict()
+    
+    def generate_artificial_data_point(self, timestamp):
+        """Generate artificial data using SARIMA forecast interpolation"""
+        if not self.interp_functions: return None
+        
+        artificial_point = {'time': timestamp, 'data_source': 'artificial'}
+        
+        # Map to corresponding historical time (loop if exceeded)
+        index = self.current_csv_index % len(self.simulation_data)
+        historical_time = self.simulation_data['time'].iloc[index]
+        time_num = mdates.date2num(historical_time)
+        
+        for param in self.params:
+            if param in self.interp_functions:
+                new_value = self.interp_functions[param](time_num).item()
+                # Apply bounds
+                if param == 'T(C)': new_value = np.clip(new_value, -60, 60)
+                elif param == 'RH(%)': new_value = np.clip(new_value, 0, 100)
+                else: new_value = max(0.001, new_value)
+                artificial_point[param] = round(new_value, 3)
+            else:
+                artificial_point[param] = 0.0  # Default if no model
+        
+        self.current_csv_index += 1
+        return artificial_point
+    
+    def real_time_data_collection(self, duration_minutes=10, interval_seconds=3):
+        """Real-time data collection with WiFi-aware switching"""
+        print(f"\nSTARTING REAL-TIME DATA COLLECTION")
+        print(f"Duration: {duration_minutes} minutes, Interval: {interval_seconds} seconds")
+        print(f"Expected data points: {int((duration_minutes * 60) / interval_seconds)}")
+        print("\n" + "="*60)
+        print("TIME     | WIFI STATUS | DATA SOURCE | SAMPLE VALUES")
+        print("="*60)
+        
+        self.is_collecting = True
+        self.collected_data, self.wifi_log = [], []
+        
+        start_time, end_time = time.time(), time.time() + (duration_minutes * 60)
+        collection_count = 0
+        
+        try:
+            while time.time() < end_time and self.is_collecting:
+                current_time = datetime.now()
+                wifi_connected = self.check_device_wifi()
+                
+                self.wifi_log.append({
+                    'timestamp': current_time,
+                    'wifi_connected': wifi_connected,
+                    'collection_number': collection_count + 1
+                })
+                
+                if wifi_connected:
+                    data_point = self.get_real_data_point(current_time)
+                    wifi_status, data_source = "CONNECTED", "REAL (CSV)"
+                else:
+                    data_point = self.generate_artificial_data_point(current_time)
+                    wifi_status, data_source = "DISCONNECTED", "ARTIFICIAL"
+                
+                if data_point:
+                    self.collected_data.append(data_point)
+                    collection_count += 1
+                    
+                    sample_values = f"T:{data_point['T(C)']:.1f}°C, RH:{data_point['RH(%)']:.1f}%, PM2.5:{data_point['PM2.5']:.1f}"
+                    print(f"{current_time.strftime('%H:%M:%S')} | {wifi_status:11} | {data_source:11} | {sample_values}")
+                
+                time.sleep(interval_seconds)
+        
+        except KeyboardInterrupt:
+            print("\nCollection stopped by user")
+            self.is_collecting = False
+        
+        print("="*60)
+        print(f"COLLECTION COMPLETED - Total data points: {len(self.collected_data)}")
+        
+        return self._analyze_collection_results()
+    
+    def _analyze_collection_results(self):
+        """Analyze collected real-time data and WiFi performance"""
+        if not self.collected_data:
+            print("No data collected")
+            return None
+        
+        df, wifi_df = pd.DataFrame(self.collected_data), pd.DataFrame(self.wifi_log)
+        
+        # Calculate statistics
+        real_count = len(df[df['data_source'] == 'real'])
+        artificial_count = len(df[df['data_source'] == 'artificial'])
+        total_count = len(df)
+        wifi_uptime = len(wifi_df[wifi_df['wifi_connected']]) / len(wifi_df) * 100 if len(wifi_df) > 0 else 0
+        
+        print(f"\nCOLLECTION ANALYSIS:")
+        print("-" * 40)
+        print(f"Total data points: {total_count}")
+        print(f"Real data points: {real_count} ({real_count/total_count*100:.1f}%)")
+        print(f"Artificial data points: {artificial_count} ({artificial_count/total_count*100:.1f}%)")
+        print(f"WiFi uptime: {wifi_uptime:.1f}%")
+        
+        # Data quality comparison
+        if real_count > 0 and artificial_count > 0:
+            print(f"\nDATA QUALITY COMPARISON:")
+            print("-" * 40)
+            real_data, artificial_data = df[df['data_source'] == 'real'], df[df['data_source'] == 'artificial']
+            
+            for param in self.params:
+                if len(real_data) > 0 and len(artificial_data) > 0:
+                    real_mean, artificial_mean = real_data[param].mean(), artificial_data[param].mean()
+                    difference = abs(real_mean - artificial_mean) / real_mean * 100
+                    print(f"{param}: Real={real_mean:.2f}, Artificial={artificial_mean:.2f}, Diff={difference:.1f}%")
+        
+        return df, wifi_df
+    
+    def create_real_time_visualization(self, df):
+        """Create visualization of collected real-time data"""
+        if df is None or len(df) == 0:
+            print("No data to visualize")
+            return
+        
+        print(f"\nCREATING REAL-TIME DATA VISUALIZATION\n" + "-" * 40)
+        
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        fig.suptitle('Real-Time Environmental Data Collection Results', fontsize=16)
+        axes_flat = axes.flatten()
+        
+        real_data, artificial_data = df[df['data_source'] == 'real'], df[df['data_source'] == 'artificial']
+        
+        for i, param in enumerate(self.params):
+            ax = axes_flat[i]
+            
+            # Plot data points by source
+            if len(real_data) > 0:
+                real_indices = [j for j, source in enumerate(df['data_source']) if source == 'real']
+                ax.scatter(real_indices, real_data[param], label='Real Data (WiFi ON)', alpha=0.7, color='blue', s=30)
+            
+            if len(artificial_data) > 0:
+                artificial_indices = [j for j, source in enumerate(df['data_source']) if source == 'artificial']
+                ax.scatter(artificial_indices, artificial_data[param], label='Artificial Data (WiFi OFF)', alpha=0.7, color='red', s=30)
+            
+            # Complete timeline
+            ax.plot(range(len(df)), df[param], alpha=0.3, color='gray', linewidth=1)
+            
+            ax.set(title=f'{param} - Real-time Collection', xlabel='Collection Point', ylabel=param)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+        
+        axes_flat[5].remove()
+        plt.tight_layout()
+        plt.show()
+    
+    def save_results(self, df=None, wifi_df=None, prefix="environmental_analysis"):
+        """Save analysis results to files"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        if df is not None:
+            data_filename = f"{self.output_dir}/{prefix}_data_{timestamp}.csv"
+            df.to_csv(data_filename, index=False)
+            print(f"Data saved: {data_filename}")
+        
+        if wifi_df is not None:
+            wifi_filename = f"{self.output_dir}/{prefix}_wifi_log_{timestamp}.csv"
+            wifi_df.to_csv(wifi_filename, index=False)
+            print(f"WiFi log saved: {wifi_filename}")
+    
+    def run_complete_analysis(self):
+        """Run complete statistical and regression analysis"""
+        print("=" * 60)
+        print("COMPLETE ENVIRONMENTAL DATA ANALYSIS")
+        print("=" * 60)
+        
+        self.load_and_clean_data()
+        self.load_may_data()
+        
+        # Statistical analysis
+        print("\n" + "="*40 + "\nSTATISTICAL ANALYSIS\n" + "="*40)
+        monthly_stats, daily_stats, overall_stats = self.calculate_statistics()
+        self.plot_temporal_trends(monthly_stats, daily_stats)
+        corr_matrix, corr_pairs = self.correlation_analysis()
+        self.distribution_analysis()
+        
+        # Regression analysis
+        print("\n" + "="*40 + "\nREGRESSION ANALYSIS (ON FULL DATA)\n" + "="*40)
+        
+        # Simple linear regression on top 3 correlation pairs
+        simple_results = {}
+        pairs = [
+            ('PM2.5', 'PM1.0'),  # PM2.5 as X, PM1.0 as Y
+            ('PM2.5', 'PM10'),   # PM2.5 as X, PM10 as Y
+            ('T(C)', 'PM1.0')    # T(C) as X, PM1.0 as Y
+        ]
+        for x_var, y_var in pairs:
+            model, r2, p_value = self.simple_linear_regression(x_var, y_var)
+            simple_results[f"{y_var}_vs_{x_var}"] = {'r2': r2, 'p_value': p_value}
+        
+        # Polynomial
+        poly_results = {}
+        for y_var in self.params:
+            results = self.polynomial_regression('time_numeric', y_var)
+            poly_results[y_var] = results
+        
+        # Time series
+        ts_results = self.time_series_regression()
+        
+        print("\n" + "="*60)
+        print("COMPLETE ANALYSIS FINISHED")
+        print(f"All results saved in '{self.output_dir}' directory")
+        print("="*60)
+        
+        return {
+            'statistical': {
+                'monthly_stats': monthly_stats, 'daily_stats': daily_stats, 'overall_stats': overall_stats,
+                'correlation_matrix': corr_matrix, 'correlation_pairs': corr_pairs
+            },
+            'regression': {
+                'simple': simple_results, 'polynomial': poly_results,
+             'time_series': ts_results
+            }
+        }
+    
+    def run_real_time_collection(self, duration_minutes=None, interval_seconds=None):
+        """Run real-time data collection system"""
+        print("=" * 60)
+        print("REAL-TIME WIFI-AWARE DATA COLLECTION")
+        print("=" * 60)
+        
+        # Get parameters from user if not provided
+        if duration_minutes is None or interval_seconds is None:
+            print("📋 COLLECTION PARAMETERS SETUP")
+            print("-" * 30)
+            
+            while True:
+                try:
+                    if duration_minutes is None:
+                        duration_input = input("Enter collection duration in minutes (default 10): ").strip()
+                        duration_minutes = int(duration_input) if duration_input else 10
+                        if duration_minutes <= 0:
+                            print("Duration must be positive. Please try again.")
+                            duration_minutes = None
+                            continue
+                    
+                    if interval_seconds is None:
+                        interval_input = input("Enter collection interval in seconds (default 3): ").strip()
+                        interval_seconds = int(interval_input) if interval_input else 3
+                        if interval_seconds <= 0:
+                            print("Interval must be positive. Please try again.")
+                            interval_seconds = None
+                            continue
+                    
+                    break
+                    
+                except ValueError:
+                    print("Please enter valid numbers. Try again.")
+                    duration_minutes = None
+                    interval_seconds = None
+            
+            # Show selected parameters
+            expected_points = int((duration_minutes * 60) / interval_seconds)
+            print(f"\nPARAMETERS CONFIRMED:")
+            print(f"   Duration: {duration_minutes} minutes")
+            print(f"   Interval: {interval_seconds} seconds")
+            print(f"   Expected data points: ~{expected_points}")
+            print()
+        
+        print("This system will:")
+        print(f"• Collect data every {interval_seconds} seconds for {duration_minutes} minutes")
+        print("• Monitor your device's WiFi connection")
+        print("• Use real CSV data when WiFi is ON")
+        print("• Generate artificial data when WiFi is OFF")
+        print("• Automatically switch between data sources")
+        print("=" * 60)
+        
+        if self.clean_data is None: self.load_and_clean_data()
+        if self.may_data is None: self.load_may_data()
+        
+        print("\nREADY TO START COLLECTION")
+        print("You can turn WiFi ON/OFF during collection to test switching")
+        input("Press Enter to start data collection...")
+        
+        df, wifi_df = self.real_time_data_collection(duration_minutes, interval_seconds)
+        
+        if df is not None:
+            self.create_real_time_visualization(df)
+            self.save_results(df, wifi_df, "realtime_collection")
+            
+            print("\n" + "=" * 60)
+            print("REAL-TIME COLLECTION COMPLETED SUCCESSFULLY")
+            print("✓ Data collected at specified intervals")
+            print("✓ WiFi monitoring performed")
+            print("✓ Automatic switching between real/artificial data")
+            print("✓ Results saved to CSV files")
+            print("=" * 60)
+        
+        return df, wifi_df
+    
+    def run_complete_system(self):
+        """Run complete system from start to finish automatically"""
+        print("=" * 80)
+        print("UNIFIED ENVIRONMENTAL DATA ANALYSIS SYSTEM - COMPLETE EXECUTION")
+        print("=" * 80)
+        print("This will run:")
+        print("1. Complete Statistical Analysis")
+        print("2. Complete Regression Analysis") 
+        print("3. Real-time WiFi-aware Data Collection (with custom parameters)")
+        print("=" * 80)
+        
+        # Phase 1: Complete Statistical and Regression Analysis
+        print("\n" + "PHASE 1: COMPLETE STATISTICAL & REGRESSION ANALYSIS")
+        print("=" * 60)
+        
+        results = self.run_complete_analysis()
+        
+        # Phase 2: Real-time Data Collection (will ask for parameters)
+        print("\n" + "PHASE 2: REAL-TIME WIFI-AWARE DATA COLLECTION")
+        print("=" * 60)
+        
+        df, wifi_df = self.run_real_time_collection()
+        
+        # Final Summary
+        print("\n" + "=" * 80)
+        print("COMPLETE SYSTEM EXECUTION FINISHED SUCCESSFULLY")
+        print("=" * 80)
+        print("Statistical analysis completed")
+        print("Regression analysis completed")
+        print("Real-time data collection completed")
+        print("All visualizations generated")
+        print(f"All results saved in '{self.output_dir}' directory")
+        print("=" * 80)
+        
+        return results, df, wifi_df
+
+def main():
+    """Main function to run the complete unified system"""
+    print("UNIFIED ENVIRONMENTAL DATA ANALYSIS SYSTEM")
+    print("Initializing complete system execution...")
+    
+    csv_file = "dataFor180DayTheatesNew.csv"
+    
+    try:
+        system = UnifiedEnvironmentalAnalysisSystem(csv_file)
+        
+        # Run complete system automatically (will ask for real-time parameters)
+        results, realtime_df, wifi_df = system.run_complete_system()
+        
+        print(f"\nFINAL SUMMARY:")
+        print(f"- Statistical & regression analysis: Complete")
+        print(f"- Real-time data points collected: {len(realtime_df) if realtime_df is not None else 0}")
+        print(f"- WiFi checks performed: {len(wifi_df) if wifi_df is not None else 0}")
+        print(f"- Results directory: {system.output_dir}")
+        
+    except FileNotFoundError:
+        print(f"Error: Could not find file '{csv_file}'")
+        print("Please ensure the CSV file is in the same directory as this script.")
+    except Exception as e:
+        print(f"Error during execution: {str(e)}")
+
+if __name__ == "__main__":
+    main()
